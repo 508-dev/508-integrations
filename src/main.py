@@ -4,11 +4,13 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from .crm import EspoCRMClient
+from .crm.document_processor import DocumentProcessor
 from .crm.processor import ContactSkillsProcessor
+from .crm.skills_extractor import SkillsExtractor
 from .models import EspoCRMWebhookPayload
 from .settings import settings
 
@@ -155,6 +157,54 @@ async def health_check() -> dict[str, Any]:
         "espocrm": "connected" if espocrm_status else "disconnected",
         "version": "0.1.0",
     }
+
+
+@app.post("/extract/dry-run")
+async def extract_dry_run(
+    text: str | None = Body(None, embed=True),
+    file: UploadFile | None = File(None),
+) -> JSONResponse:
+    if not text and not file:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide resume text in 'text' or upload a supported file",
+        )
+
+    try:
+        resume_text = ""
+        source = "text"
+
+        if text:
+            resume_text = text.strip()
+            if not resume_text:
+                raise ValueError("Provided text is empty")
+        elif file:
+            if not file.filename:
+                raise ValueError("Uploaded file is missing a filename")
+            content = await file.read()
+            processor = DocumentProcessor()
+            resume_text = processor.extract_text(content, file.filename)
+            source = file.filename
+
+        extractor = SkillsExtractor()
+        extracted = extractor.extract_skills(resume_text)
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "source": source,
+                "skills": extracted.skills,
+                "confidence": extracted.confidence,
+                "model": extracted.source,
+            }
+        )
+
+    except ValueError as e:
+        logger.warning("Dry-run extraction input error", error=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Dry-run extraction failed", error=str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="Extraction failed")
 
 
 @app.get("/ping")
