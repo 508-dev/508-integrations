@@ -1,15 +1,20 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from .crm import EspoCRMClient
+from .crm.document_processor import DocumentProcessor
 from .crm.processor import ContactSkillsProcessor
+from .crm.skills_extractor import SkillsExtractor
 from .models import EspoCRMWebhookPayload
 from .settings import settings
+
+VERSION = "0.1.0"
 
 structlog.configure(
     processors=[
@@ -50,7 +55,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title="508 Integrations",
     description="Integration service for EspoCRM webhooks with resume skills extraction",
-    version="0.1.0",
+    version=VERSION,
     lifespan=lifespan,
 )
 
@@ -152,7 +157,64 @@ async def health_check() -> dict[str, Any]:
     return {
         "status": "healthy" if espocrm_status else "degraded",
         "espocrm": "connected" if espocrm_status else "disconnected",
-        "version": "0.1.0",
+        "version": VERSION,
+    }
+
+
+@app.post("/extract/dry-run")
+async def extract_dry_run(
+    text: str | None = Body(None, embed=True),
+    file: UploadFile | None = File(None),
+) -> JSONResponse:
+    if not text and not file:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide resume text in 'text' or upload a supported file",
+        )
+
+    try:
+        resume_text = ""
+        source = "text"
+
+        if text:
+            resume_text = text.strip()
+            if not resume_text:
+                raise ValueError("Provided text is empty")
+        elif file:
+            if not file.filename:
+                raise ValueError("Uploaded file is missing a filename")
+            content = await file.read()
+            processor = DocumentProcessor()
+            resume_text = processor.extract_text(content, file.filename)
+            source = file.filename
+
+        extractor = SkillsExtractor()
+        extracted = extractor.extract_skills(resume_text)
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "source": source,
+                "skills": extracted.skills,
+                "confidence": extracted.confidence,
+                "model": extracted.source,
+            }
+        )
+
+    except ValueError as e:
+        logger.warning("Dry-run extraction input error", error=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Dry-run extraction failed", error=str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="Extraction failed")
+
+
+@app.get("/ping")
+async def ping() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": VERSION,
     }
 
 
@@ -160,7 +222,7 @@ async def health_check() -> dict[str, Any]:
 async def root() -> dict[str, str]:
     return {
         "message": "508 Integrations Service",
-        "version": "0.1.0",
+        "version": VERSION,
         "docs": "/docs",
     }
 
